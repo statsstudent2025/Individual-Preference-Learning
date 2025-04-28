@@ -1,0 +1,226 @@
+---
+title: "Rice Data"
+output: html_document
+date: "2025-04-26"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Libraries
+```{r}
+library(ggplot2)
+library(tidyr)
+library(dplyr)
+library(PLMIX)
+library(BayesMallows)
+library(extraDistr) # Used for truncated Poisson
+library(coda)
+library(gtools)
+library(tidytext)
+source('Functions.R')
+```
+
+
+## Explanatory Data Analysis
+
+```{r}
+# say your data.frame is called `df`
+
+# 1. count missings in each row
+missing_counts <- rowSums(d_rice == 0)
+
+# 2. tabulate frequencies
+freq_table <- table(missing_counts)
+
+# 3. barplot
+barplot(
+  freq_table,
+  xlab = "Number of missing values per row",
+  ylab = "Number of rows",
+  main = "Frequency of missing‐value counts",
+  col  = "steelblue"
+)
+
+
+############################### Make a ranking  dataframe#################
+# Convert top ordering to ranking dataframe
+ordering_df <- d_rice
+colnames(ordering_df) <- c('Rank_1','Rank_2','Rank_3','Rank_4','Rank_5')
+
+# Replace NULL with NA (handling NULL explicitly)
+ordering_df[is.null(ordering_df)] <- NA
+
+# Get the unique items (ignoring NA values) from the entire dataframe
+items <- unique((unlist(ordering_df)))
+
+# Create an empty ranking dataframe
+ranked_df <- data.frame(matrix(NA, nrow = nrow(ordering_df), ncol = length(items)))
+colnames(ranked_df) <- items
+
+# For each row, assign ranks to items, ignoring NA values
+for (i in 1:nrow(ordering_df)) {
+  ordered_items <- na.omit(ordering_df[i, ])  # Get the non-NA items for that row
+  
+  # Assign ranks for the non-NA items
+  for (rank in 1:length(ordered_items)) {
+    ranked_df[i, ordered_items[rank]] <- rank  # Assign rank to the corresponding item column
+  }
+}
+
+
+# View the result
+
+
+
+
+```
+## Bayesian Inference with Mallows
+```{r}
+
+
+########################## ------Checking for best cluster--------####################
+partial_mallows <- as.matrix(rank_df)
+# SIMULATED CLUSTER DATA
+set.seed(1)
+n_clusters <- seq(from = 1, to = 5)
+
+# Assuming setup_rank_data is a function that prepares the data correctly for Mallows mixtures
+models <- compute_mallows_mixtures(
+  n_clusters = n_clusters, 
+  data = setup_rank_data(ranking = d_rice),
+  compute_options = set_compute_options(nmc = 10000, include_wcd = TRUE)
+)
+
+assess_convergence(models)
+
+burnin(models) <- 1000
+plot_elbow(models) #opt for 4 clusters
+
+```
+```{r}
+######################### ---------Mallows MCMC with M=4-------#####################
+mixture_model <- compute_mallows(
+data = setup_rank_data(partial_mallows),
+model_options = set_model_options(n_clusters = 4),
+compute_options = set_compute_options(nmc = 20000, save_aug = TRUE))
+
+
+assess_convergence(mixture_model)
+
+# We set the burnin to 2000
+burnin(mixture_model) <- 2000
+
+# We can now look at posterior quantities
+# Posterior of scale parameter alpha
+plot(mixture_model)
+plot(mixture_model, parameter = "rho", items = 1:5)
+
+plot(mixture_model, parameter = "cluster_probs")
+
+
+# We can also look at a cluster assignment plot
+plot(mixture_model, parameter = "cluster_assignment")
+```
+```{r}
+#################--------- Heatplots showing posterior probabilities of the consensus for each cluster---------###########
+
+heatplot_consensus <-function(data = mixture_model){
+  
+  cl_assign <- assign_cluster(mixture_model, soft = FALSE)
+  
+  for (i in 1: length(unique(mixture_model$rho$cluster)) ){
+    # build the string "cluster 1", "cluster 2", …
+  cluster_label <- paste("Cluster", i)        # yields "cluster 1", etc.
+  subset_ranks <- partial_mallows[cl_assign$map_cluster == cluster_label,, drop = FALSE ] #original rankings but with cluster i
+  
+  
+  #  Convert to a plain numeric/integer matrix
+  subset_ranks_mat <- as.matrix(subset_ranks)
+  storage.mode(subset_ranks_mat) <- "integer"
+  # refit a single‐cluster Mallows
+  subfit <- compute_mallows(setup_rank_data(subset_ranks_mat), compute_options = set_compute_options(nmc = 20000, save_aug = TRUE))
+  burnin(subfit) <- 2000
+  
+  # plot the heatmap
+  print(heat_plot(subfit, type = "CP"))
+  }
+  }
+
+
+heatplot_consensus(mixture_model)
+```
+
+```{r}
+
+```
+
+
+
+```{r}
+
+
+#################---------- Fitting Multiple Clusters for PL ----------------############
+# SIMULATED CLUSTER DATA
+set.seed(1)
+n_clusters <- seq(from = 1, to = 5)
+
+
+# For plackett-Luce we saw G=2 clusters gave the best fit
+
+multiple_pl <- list()
+
+# mixing starts to deteriorate at G=3, parameters are not significant enough, hecne we opt for G = 2
+for (i  in  n_clusters){
+GIBBSPL <- gibbsPLMIX_updated(d_rice, K = ncol(d_rice), G = i, n_iter = 10000, n_burn = 1000)
+
+multiple_pl[[i]] <- list(mcmc_GIBBS = gsPLMIX_to_mcmc(GIBBSPL), 
+                         scores_PL = GIBBSPL$P ,# posterior utility scores
+                          weights_PL = GIBBSPL$W,
+                         Latent_PL =  GIBBSPL$Z
+                         )
+
+plot(mcmc_GIBBS[,1:2])
+                      
+}
+
+
+
+
+
+
+
+```
+
+```{r}
+###############-------- Plotting Boxplots to gaugue distribution of parameters---------#######
+par(mar=c(4,4,2,1))
+#plot((multiple_pl[[1]][[1]])[,2:6])
+plot((multiple_pl[[2]][[1]])[,1:18])
+boxplot(multiple_pl[[2]][[2]])
+
+
+# Convert your matrix to a data frame
+df <- as.data.frame(multiple_pl[[3]][[2]])
+
+# Now you can use pivot_longer to reshape the data
+df_long <- df %>%
+  pivot_longer(cols = starts_with("p_"), 
+               names_to = "variable", 
+               values_to = "value")
+
+# Create a new 'cluster' column based on the naming convention
+df_long$cluster <- ifelse(grepl("1$", df_long$variable), "Cluster 1", "Cluster 2")
+
+# Now you can proceed with your ggplot
+ggplot(df_long, aes(x = variable, y = value, fill = cluster)) +
+  geom_boxplot() +
+  scale_fill_manual(values = c("Cluster 1" = "blue", "Cluster 2" = "red")) +
+  theme_minimal() +
+  xlab("Variable") + 
+  ylab("Value")
+
+
+```
+

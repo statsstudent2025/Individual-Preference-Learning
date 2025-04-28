@@ -1,0 +1,1165 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+This is an [R Markdown](http://rmarkdown.rstudio.com) Notebook. When you execute code within the notebook, the results appear beneath the code.
+
+Try executing this chunk by clicking the *Run* button within the chunk or by placing your cursor inside it and pressing *Ctrl+Shift+Enter*.
+
+```{r}
+plot(cars)
+```
+
+Add a new chunk by clicking the *Insert Chunk* button on the toolbar or by pressing *Ctrl+Alt+I*.
+
+When you save the notebook, an HTML file containing the code and output will be saved alongside it (click the *Preview* button or press *Ctrl+Shift+K* to preview the HTML file).
+
+The preview shows you a rendered HTML copy of the contents of the editor. Consequently, unlike *Knit*, *Preview* does not run any R code chunks. Instead, the output of the chunk when it was last run in the editor is displayed.
+
+```{r libraries}
+# Load necessary libraries
+library(ggplot2)
+library(tidyr)
+library(dplyr)
+library(PLMIX)
+library(BayesMallows)
+library(extraDistr) # Used for truncated Poisson
+library(coda)
+library(gtools)
+library(tidytext)
+```
+
+Adding functions from my source code
+
+```{r}
+source('Functions.R')
+```
+
+## Simulating Mallows Dataset using MCMC Scheme-BayesMallows Package
+
+```{r sample data}
+K = 8  # Number of items
+N = 100 # Number of Assesors
+alpha = 4
+rho = random_permutation(K)
+
+max_index <- which.max(rho)
+min_index <- which.min(rho)
+
+# Thinning used due to large autocorrelation - we use 250 from viewing autocorr plot
+invisible(sim_mallows <-sample_mallows_custom(rho0 = rho, alpha0 = alpha, n_samples = N, diagnostic =TRUE, burnin = 100000, thinning = 250, items_to_plot = c(max_index,min_index)) )
+
+
+```
+
+Plot visualising rho
+
+```{r}
+# Create item labels 
+items <- paste0("Item ", 1:8)
+# Create a data frame
+df <- data.frame(
+  Item = factor(items, levels = items),  # ensure order is preserved
+  Rank = rho
+)
+# Plot the ranking
+ggplot(df, aes(x = Item, y = Rank)) +
+  geom_point(size = 5, color = "steelblue") +
+  geom_text(aes(label = Rank), vjust = -1.2, size = 5) +
+  scale_y_reverse(breaks = 0:8) +  # Rank 1 at top
+  labs(
+    title = "Visualisation of a Ranking Vector",
+    x = "Item",
+    y = "Rank (lower is better)"
+  ) +
+  theme_minimal(base_size = 14)
+```
+
+## Simulating Partial data
+
+```{r partial data}
+result<- (making_partial_new(sim_mallows)) # output from function
+PL_partial <- result[[2]] # Plackett Luce partial data
+MM_partial <- result[[1]] # Mallows partial data
+samples_per_assesor <- result[[3]] # Samples per assessor from truncated poisson
+
+
+```
+
+## Sampling from Posterior using Partial Data- Plackett-Luce
+
+```{r Posterior Sampling-PL}
+GIBBSPL <- gibbsPLMIX(PL_partial, K = ncol(PL_partial), G = 1, n_iter = 10000, n_burn = 1000)
+mcmc_GIBBS <-gsPLMIX_to_mcmc(GIBBSPL)
+scores_PL <- GIBBSPL$P # posterior utility scores
+
+```
+
+```{r Convergence and Autocorr plots-PL}
+par(mar=c(4,4,2,1))
+autocorr.plot(mcmc_GIBBS)
+plot(mcmc_GIBBS) # Convergence of all the parameters
+
+```
+
+```{r posterior consensus}
+# MAP estimate
+
+(mapPLMIX(PL_partial, K= ncol(PL_partial),G = 1))
+
+
+```
+
+## Finding Posterior probabilities for next m - PL
+
+-   We try for m = 1 and m = 2.
+
+```{r prob of item in top k_j + m}
+Next_m_probs<- function(m,data_){
+start_time <- Sys.time() #Start time
+T<- nrow(scores_PL)
+posterior_nextm_PL <- (matrix(0, nrow = N, ncol = K) ) # N = assessors, K =  no of items
+for (i in 1:T){
+  
+  utility_i <- scores_PL[i,] #ith iteration of utility scores
+  for (j in 1:nrow(data_)){ #iterating by assessor
+    curr_assessor <- PL_partial[j,]
+    ranked_items <- curr_assessor[curr_assessor!= 0]  # Items already ranked
+    unranked_items <- setdiff(1:K, ranked_items)  # Items missing in this row
+    
+    posterior_nextm_PL[j,ranked_items] = posterior_nextm_PL[j,ranked_items] + 1
+    
+    # Compute probabilities only for unranked items
+    if (length(unranked_items) > m) {
+      theta_unranked <- utility_i[unranked_items]  # Get theta values for unranked
+      simulated_ranking <- SamplingCompleteRankings_PL(theta_unranked)  # Compute exact probs
+      
+      # Then add + 1 only to the places that got a rank <=m
+      positions_to_update <- which(simulated_ranking <=m)
+      posterior_nextm_PL[j,unranked_items[positions_to_update]]=  posterior_nextm_PL[j,unranked_items[positions_to_update]] + 1
+      } 
+    
+  }
+  
+  
+}
+posterior_nextm_PL =  posterior_nextm_PL/T
+end_time<- Sys.time()
+# Calculate the difference
+execution_time <- end_time - start_time
+print(paste("Time taken: ", execution_time))
+
+return (posterior_nextm_PL)
+}
+
+```
+
+```{r getting the posterior probs for PL}
+next_1_probs_PL <- Next_m_probs(1)
+next_2_probs_PL <- Next_m_probs(2)
+
+```
+
+## Sampling from Posterior-Using Partial Data - Mallows
+
+```{r Posterior Sampling-MM}
+
+# Alter the data correctly for mallows model
+partial_mallows <- MM_partial
+partial_mallows[partial_mallows == 0] <- NA
+partial_mallows <- as.matrix(partial_mallows)
+
+# Keep augmented data
+result_BMM <- compute_mallows(
+  data = setup_rank_data(partial_mallows),
+  compute_options = set_compute_options(nmc = 50000,save_aug = TRUE, burnin = 5000))
+
+```
+
+```{r convergence graphs}
+# Extract posterior rho and alpha 
+
+# Extract after burnin so > 1000
+rho_samples <- t(as.data.frame(result_BMM$rho_samples))[1000:10000,] ; NULL
+
+alpha_samples <- t(result_BMM$alpha_samples)[1000:10000,]
+
+# converges to the exact rho
+assess_convergence(result_BMM,parameter = 'rho', items = 1:8) 
+# Hovers around the exact alpha = 4
+assess_convergence(result_BMM, parameter = 'alpha')
+
+
+```
+```{r heatplot of posterior distribution}
+heat_plot(result_BMM)
+```
+
+```{r prob of item in top k_j + m MM}
+
+Next_m_probs_MM<- function(m){
+  start_time <- Sys.time() #Start time
+  df_try <-result_BMM$augmented_data[result_BMM$augmented_data$iteration > burnin(result_BMM),]
+
+number_of_samples_per_assesor <- rowSums(PL_partial!=0)
+
+assessors <- unique(df_try$assessor)
+items <- unique(df_try$item)
+
+posterior_prob_BMM <- matrix(0,nrow = length(assessors), ncol = length(items), dimnames = list(assessors,items))
+
+n_samples <- length(unique(df_try$iteration))
+
+for (i in seq_along(assessors)) {
+  k <- number_of_samples_per_assesor[i]
+  for (j in seq_along(items)) {
+    count <- sum(df_try$assessor == assessors[i] & df_try$item == items[j] & df_try$value <= k+m ) # Item in top k + m
+    posterior_prob_BMM[i, j] <- count / n_samples
+  }
+}
+end_time<- Sys.time()
+# Calculate the difference
+execution_time <- end_time - start_time
+print(paste("Time taken: ", execution_time))
+return(list(posterior_prob_BMM,assessors,items))
+
+
+  
+}
+
+```
+
+```{r getting posterior probs for MM}
+res1 <- Next_m_probs_MM(1)
+res2 <- Next_m_probs_MM(2)
+next_1_probs_MM <- res1[[1]]
+next_2_probs_MM <- res2[[1]]
+assessors <- res1[[2]]
+items <- res1[[3]]
+
+
+```
+
+## Next Top m predictions -illustrate with 3 assessors ( We take the m items with maximum P(i in top m \|data) \<- how we recommend). We sample individuals that have atleast m+1 missing items otherwise the probability will be 1 for all the remaining items
+
+```{r top 1 predictions}
+# Setting dimension names
+dimnames(next_1_probs_PL) <- list(assessors,items)
+dimnames(next_2_probs_PL)<- list(assessors, items)
+dimnames(sim_mallows) <- list(assessors,items)
+
+# Getting relevant sample space to select from then sampling
+sample_space = which(rowSums(PL_partial == 0) > 2) #Sample individuals with more than m missing
+chosen_assesors =  sample(sample_space, 3, replace = FALSE)
+
+
+# Taking the posterior probabilities calculated from sampled individuals as well as their true rankings for comparison
+chosen_PL =  next_1_probs_PL[chosen_assesors,]
+chosen_BMM =  next_1_probs_MM[chosen_assesors,]
+chosen_true_rank =  sim_mallows[chosen_assesors,]
+
+true_rank =  as.data.frame(as.table((chosen_true_rank)))
+colnames(true_rank)<- c("Assessor", "Item", "True_Rank")
+
+prob_data_PL =  as.data.frame(as.table(chosen_PL))
+colnames(prob_data_PL)<- c("Assessor", "Item", "Probability")
+
+prob_data_MM  =  as.data.frame(as.table(chosen_BMM))
+colnames(prob_data_MM)<- c("Assessor", "Item", "Probability")
+```
+
+```{r graphing top 1}
+
+# Convert to long format
+Partial_Long <- MM_partial %>%
+  mutate(Assessor = factor(row_number())) %>%
+  pivot_longer(cols = starts_with('X'),
+               names_to = 'Item',
+               values_to = 'Rank')
+
+library(dplyr)
+library(ggplot2)
+library(tidytext)  # for reorder_within() and scale_x_reordered()
+
+plot_top_m_unranked_probs <- function(prob_data, model_name, top_m = 2) {
+  data <- prob_data %>%
+    left_join(Partial_Long, by = c('Assessor', 'Item')) %>%
+    left_join(true_rank, by = c('Assessor', 'Item')) %>%
+    mutate(unranked = Rank == 0) %>%
+    filter(unranked == TRUE ) %>%
+    mutate(Assessor = factor(Assessor, labels = paste("Individual", 1:length(unique(Assessor)))))
+
+  if (nrow(data) == 0) {
+    warning(paste("No unranked items with True Rank <=", top_m, "found for model:", model_name))
+    return(NULL)
+  }
+
+  data %>%
+    group_by(Assessor) %>%
+    mutate(Item = reorder_within(Item, True_Rank, Assessor)) %>%
+    ggplot(aes(x = Item, y = Probability, fill = Probability)) +
+    geom_bar(stat = 'identity') +
+    facet_wrap(~ Assessor, scales = 'free_x', ncol = 3) +
+    scale_x_reordered() +
+    scale_fill_gradient(low = "blue", high = "red", name = "Probability") +
+    labs(
+      title = paste('Posterior Probabilities for Top', top_m, 'Unranked Items -', model_name),
+      x = 'Item (sorted by True Rank)',
+      y = 'Probability'
+    ) +
+    theme_minimal(base_size = 13) +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      strip.text = element_text(face = "bold", size = 11),
+      strip.background = element_rect(fill = "black", color = "black"),
+      strip.text.x = element_text(color = "white"),
+      panel.spacing = unit(1, "lines")
+    )
+}
+
+
+
+
+# Plot for each model
+plot_top_m_unranked_probs(prob_data_MM, "Mallows", 1)
+plot_top_m_unranked_probs(prob_data_PL, "Plackett-Luce",1 )
+
+
+```
+
+```{r top 2 predictions}
+# We will use the same chosen assessors
+
+
+
+# Taking the posterior probabilities calculated from sampled individuals as well as their true rankings for comparison
+chosen_PL =  next_2_probs_PL[chosen_assesors,]
+chosen_BMM =  next_2_probs_MM[chosen_assesors,]
+chosen_true_rank =  sim_mallows[chosen_assesors,]
+
+true_rank =  as.data.frame(as.table((chosen_true_rank)))
+colnames(true_rank)<- c("Assessor", "Item", "True_Rank")
+
+prob_data_PL =  as.data.frame(as.table(chosen_PL))
+colnames(prob_data_PL)<- c("Assessor", "Item", "Probability")
+
+prob_data_MM  =  as.data.frame(as.table(chosen_BMM))
+colnames(prob_data_MM)<- c("Assessor", "Item", "Probability")
+
+```
+
+```{r graphing top 2 predictions}
+
+# Plot for each model
+plot_top_m_unranked_probs(prob_data_MM, "Mallows", 2)
+plot_top_m_unranked_probs(prob_data_PL, "Plackett-Luce",2 )
+
+```
+
+# Calibration of our estimates and predictions
+
+```{r calibration function}
+library(scales)
+plot_calibration_curve <- function(posterior_matrix, model_name, m,data_) {
+  # Ensure posterior is in long form
+  posterior_df <- as.data.frame(as.table(posterior_matrix))
+  colnames(posterior_df) <- c("Assessor", "Item", "Probability")
+  
+  # Construct ranking reference
+  total_true_rank <- as.data.frame(as.table(data_))
+  colnames(total_true_rank) <- c("Assessor", "Item", "True_Rank")
+
+  # Merge with ranking and filter for unranked
+  df <- total_true_rank %>%
+    left_join(Partial_Long, by = c('Assessor', 'Item')) %>%
+    mutate(unranked = Rank == 0)
+
+  df_merged <- df %>%
+    left_join(posterior_df, by = c("Assessor", "Item")) %>%
+    filter(unranked == TRUE) %>%
+    filter(samples_per_assesor[as.integer(Assessor)] < ncol(data_)-2) %>%
+    mutate(Success = samples_per_assesor[as.integer(Assessor)] + m >= True_Rank)
+
+  # Bin probabilities and compute empirical success/failure rate
+  df_binned <- df_merged %>%
+    mutate(Prob_Bin = cut(Probability, breaks = seq(0, 1, by = 0.25), include.highest = TRUE)) %>%
+    group_by(Prob_Bin, Success) %>%
+    summarise(Count = n(), .groups = "drop") %>%
+    group_by(Prob_Bin) %>%
+    mutate(Total = sum(Count),
+           Empirical_Prob = Count / Total)
+
+  # Plot calibration
+  ggplot(df_binned, aes(x = Prob_Bin, y = Empirical_Prob, fill = Success)) +
+    geom_col(position = position_dodge(width = 0.9)) +
+    geom_text(aes(label = paste0(scales::percent(Empirical_Prob, accuracy = 0.1), "\n(n = ", Total, ")")),
+          position = position_dodge(width = 0.9),
+          vjust = -0.3, size = 3)+
+    scale_fill_manual(values = c("red", "green"), labels = c("Fail", "Success")) +
+    ylab("Empirical Proportion") +
+    xlab("Predicted Probability Bin") +
+    ggtitle(paste("Empirical Success/Fail by Predicted Probability Bin\nModel:", model_name)) +
+    expand_limits(y = 1.1 * max(df_binned$Empirical_Prob, na.rm = TRUE)) +
+    theme_minimal() +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      legend.title = element_blank()
+    )
+}
+
+```
+
+```{r top 2 calibration}
+plot_calibration_curve(next_2_probs_MM, "Mallows", m = 2)
+plot_calibration_curve(next_2_probs_PL, "Plackett-Luce", m = 2)
+```
+## WAIC
+
+```{r, PL WAIC}
+# Plackett Luce
+
+# Take sim_mallows to an ordering set
+ordering_sim <- as.top_ordering(sim_mallows, format_input = 'ranking', aggr = FALSE); NULL
+
+# Preallocate matrix: N rows, S posterior samples
+loglik_matrix_PL <- matrix(NA, nrow = nrow(ordering_sim), ncol = nrow(scores_PL)); NULL
+
+N <- nrow(ordering_sim)
+S <- nrow(scores_PL)
+
+# Loop over samples (columns) and compute per-observation likelihood
+for (s in 1:S) {
+  for (i in 1:N) {
+    loglik_matrix_PL[i, s]  <- loglikPLMIX(
+      pi_inv = matrix(ordering_sim[i, ], nrow = 1),                  # single ranking
+      p = matrix(scores_PL[s, ], nrow = 1),                          # single posterior sample
+      ref_order = matrix(1:ncol(ordering_sim), nrow = 1),           # required, arbitrary for G = 1
+      weights = c(1)                                                 # G = 1
+    ) ; NULL
+  }
+}
+
+lppd <- sum(log(rowMeans(exp(loglik_matrix_PL))))
+penalty_waic <- sum(apply(loglik_matrix_PL, 1, var))
+waic_PL <- -2 * (lppd - penalty_waic)
+
+
+
+
+
+```
+
+```{r MM WAIC}
+# Mallows
+
+# Preallocate matrix: N rows, S posterior samples
+loglik_matrix_MM <- matrix(NA, nrow = nrow(ordering_sim), ncol = nrow(rho_samples))
+
+# Loop over samples (columns) and compute per-observation likelihood
+
+N <- nrow(sim_mallows)
+S <- nrow(rho_samples)
+for (s in 1:S) {
+  for (i in 1:N) {
+    loglik_matrix_MM[i, s] <- get_mallows_loglik(
+                    rho = matrix((rho_samples[s,]), nrow = 1),
+                    alpha = alpha_samples[s],
+                    weights = c(1),
+                    rankings = matrix(rep(sim_mallows[i,], times = 2), nrow = 2, byrow = TRUE),
+                    log = TRUE) /2
+  }
+}
+
+
+#WAIC of Mallows model quite a bit lower than the one with PL so it is clear that the Mallows model is a better model for prediction for these two models
+lppd <- sum(log(rowMeans(exp(loglik_matrix_MM))))
+penalty_waic <- sum(apply(loglik_matrix_MM, 1, var))
+waic_MM <- -2 * (lppd - penalty_waic)
+
+```
+
+```{r Plots comparing value}
+# Data frame
+df <- data.frame(
+  model = c("Plackett–Luce", "Mallows"),
+  WAIC  = c(waic_PL, waic_MM)
+)
+
+# Horizontal bar chart
+ggplot(df, aes(x = WAIC, y = reorder(model, WAIC))) +
+  geom_col(fill = "steelblue") +
+  geom_text(aes(label = round(WAIC, 1)),
+            hjust = -0.1,           # just to the right of the bar
+            size  = 3.5) +
+  scale_x_continuous(expand = expansion(add = c(0, max(df$WAIC)*0.1))) +
+  labs(x = "WAIC",
+       y = NULL,
+       title = "WAIC Comparison: Lower is Better") +
+  theme_minimal()
+```
+
+Now we do the exact same thing but with Plackett-Luce Simulated data
+
+## Simulating Plackett-Luce Data
+
+BIG NOTE: I just realised throughout this analysis I used the Plackett-Luce orderings as rankings. But it doesn't matter in this case since 1 maps to 10 and vice versa, 2 maps to 9 and vice versa etc... so it will give the same result. Essentially the ranking and the ordering in this case is right distance invariant.
+
+- K = 15 items
+- N = 30 assessors (much more uncertainty than in our Mallows test set)
+- Utility scores go from 0.1 to 1 
+```{r setting up PL variables for simulated dataset}
+
+K = 10  # Number of items
+N = 30 # Number of Assesors - now we have more uncertainty
+utility_scores <- seq(from = 0.1, to = 1, by = 0.1) # Utility parameters will be proportional to these values
+normalised_scores <- utility_scores/sum(utility_scores)
+source('Functions.R')
+
+```
+
+```{r Simulating PL rankings }
+sim_pl <- as.matrix(SimulateNRankings(utility_scores,N = N))
+
+# Creating partial data 
+result <- (making_partial_new(sim_pl)) # output from function
+PL_partial <- result[[2]] # Plackett Luce partial data
+MM_partial <- result[[1]] # Mallows partial data
+samples_per_assesor <- result[[3]] # Samples per assessor from truncated poisson
+
+```
+
+# Bayesian Inference - Plackett Luce 
+```{r Posterior sampling PL}
+GIBBSPL <- gibbsPLMIX(PL_partial, K = ncol(sim_pl), G = 1, n_iter = 50000, n_burn = 5000)
+mcmc_GIBBS <-gsPLMIX_to_mcmc(GIBBSPL)
+scores_PL <- GIBBSPL$P
+
+```
+```{r checking convergence of posterior}
+par(mar=c(4,4,2,1))
+autocorr.plot(mcmc_GIBBS)
+plot(mcmc_GIBBS) # Convergence of all the parameters
+```
+```{r}
+CI_PL <-data.frame(summary(GIBBSPL)$`95%_HPD_intervals`)
+# Create a vector with the parameter names
+parameter_names <- c('w_1', 'X_01', 'X_02', 'X_03', 'X_04', 'X_05', 'X_06', 'X_07', 'X_08', 'X_09', 'X_10','i','d','c')
+
+# Add the parameter names to the CI_PL data frame
+CI_PL$parameter <- parameter_names
+# Filter data for parameters starting with 'p'
+filtered_data <- CI_PL %>% filter(grepl("^X", parameter))
+
+# Create the plot
+ggplot(filtered_data, aes(x = parameter, y = lower)) +
+  geom_point(color = 'blue') +
+  geom_errorbar(aes(ymin = lower, ymax = upper), width = 0.2, color = 'blue') +
+  labs(title = "Confidence Intervals for Parameters Starting with 'p'",
+       x = "Parameter",
+       y = "Value") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+
+
+## Finding next m probabilities - PL
+```{r prob of item in top kj + m}
+next_1_probs_PL <- Next_m_probs(1, sim_pl)
+next_2_probs_PL <- Next_m_probs(2,sim_pl)
+
+```
+## Sampling from Posterior-Using Partial Data - Mallows
+```{r Posterior Sampling - MM}
+# Alter the data correctly for mallows model
+partial_mallows <- MM_partial
+partial_mallows[partial_mallows == 0] <- NA
+partial_mallows <- as.matrix(partial_mallows)
+
+# Keep augmented data
+result_BMM <- compute_mallows(
+  data = setup_rank_data(partial_mallows),
+  compute_options = set_compute_options(nmc = 50000,save_aug = TRUE, burnin = 5000))
+```
+
+```{r convergence graphs 2}
+# Extract posterior rho and alpha 
+
+# Extract after burnin so > 1000
+rho_samples <- t(as.data.frame(result_BMM$rho_samples))[1000:10000,] ; NULL
+
+alpha_samples <- t(result_BMM$alpha_samples)[1000:10000,]
+
+# converges to the exact rho
+assess_convergence(result_BMM,parameter = 'rho', item = 1:10) 
+
+# Hovers around the exact alpha = 4
+assess_convergence(result_BMM, parameter = 'alpha')
+```
+```{r}
+plot(result_BMM, parameter = 'rho', items = 1:10)
+```
+
+```{r}
+heat_plot(result_BMM)
+
+# Convert the matrix to a data frame for easier manipulation
+rho_samples_df <- as.data.frame(rho_samples)
+
+# Calculate the frequency of each rank for each item
+rank_probabilities <- apply(rho_samples_df, 2, function(x) table(factor(x, levels = 1:10)) / length(x))
+
+# Convert the result into a data frame for better visualization
+rank_probabilities_df <- as.data.frame((rank_probabilities))
+
+colnames(rank_probabilities_df) <- c('X_01', 'X_02', 'X_03', 'X_04', 'X_05', 'X_06', 'X_07', 'X_08', 'X_09', 'X_10')
+
+
+# Print the rank probabilities for each item
+print(rank_probabilities_df)
+
+library(ggplot2)
+library(reshape2)
+
+# Sort the columns by their values in the first row in descending order
+df<- rank_probabilities_df
+# Load necessary libraries
+library(ggplot2)
+library(reshape2)
+
+# Assuming your dataframe is called 'df'
+# Sort the columns based on the first row values (as numeric vector)
+sorted_columns <- order(as.numeric(df[1, ]), decreasing = TRUE)
+
+# Reorder the dataframe columns according to the sorted columns
+df_sorted <- df[, sorted_columns]
+
+# Add a rank column (numeric rank) to the data
+df_sorted$Rank <- as.numeric(rownames(df_sorted))
+
+# Melt the data into long format
+df_long <- melt(df_sorted, id.vars = "Rank", variable.name = "Item", value.name = "Probability")
+
+# Plot the heatmap
+ggplot(df_long, aes(x = Item, y = Rank, fill = Probability)) +
+  geom_tile() +
+  scale_fill_gradient(low = "turquoise", high = "blue") +
+  labs(title = "Heatmap of Rank Probabilities for Items", x = "Item", y = "Rank") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+
+```
+
+
+```{r getting posterior probs for MM , PL data}
+
+res1 <- Next_m_probs_MM(1)
+res2 <- Next_m_probs_MM(2)
+next_1_probs_MM <- res1[[1]]
+next_2_probs_MM <- res2[[1]]
+assessors <- res1[[2]]
+items <- res1[[3]]
+
+```
+
+# Next Top m predictions - illustrate with 3 assessors
+```{r top 1  predictions}
+# Setting dimension names
+dimnames(next_1_probs_PL) <- list(assessors,items)
+dimnames(next_2_probs_PL)<- list(assessors, items)
+dimnames(sim_pl) <- list(assessors,items)
+
+# Getting relevant sample space to select from then sampling
+sample_space = which(rowSums(PL_partial == 0) > 2) #Sample individuals with more than m missing
+chosen_assesors =  sample(sample_space, 3, replace = FALSE)
+
+
+# Taking the posterior probabilities calculated from sampled individuals as well as their true rankings for comparison
+chosen_PL =  next_1_probs_PL[chosen_assesors,]
+chosen_BMM =  next_1_probs_MM[chosen_assesors,]
+chosen_true_rank =  sim_pl[chosen_assesors,]
+
+true_rank =  as.data.frame(as.table((chosen_true_rank)))
+colnames(true_rank)<- c("Assessor", "Item", "True_Rank")
+
+prob_data_PL =  as.data.frame(as.table(chosen_PL))
+colnames(prob_data_PL)<- c("Assessor", "Item", "Probability")
+
+prob_data_MM  =  as.data.frame(as.table(chosen_BMM))
+colnames(prob_data_MM)<- c("Assessor", "Item", "Probability")
+
+# Convert to long format
+Partial_Long <- MM_partial %>%
+  mutate(Assessor = factor(row_number())) %>%
+  pivot_longer(cols = starts_with('X'),
+               names_to = 'Item',
+               values_to = 'Rank')
+
+# Plot for each model
+plot_top_m_unranked_probs(prob_data_MM, "Mallows", 1)
+plot_top_m_unranked_probs(prob_data_PL, "Plackett-Luce",1 )
+
+```
+
+```{r top 2 predictions , PL data}
+# We will use the same chosen assessors
+
+
+# Taking the posterior probabilities calculated from sampled individuals as well as their true rankings for comparison
+chosen_PL =  next_2_probs_PL[chosen_assesors,]
+chosen_BMM =  next_2_probs_MM[chosen_assesors,]
+chosen_true_rank =  sim_pl[chosen_assesors,]
+
+true_rank =  as.data.frame(as.table((chosen_true_rank)))
+colnames(true_rank)<- c("Assessor", "Item", "True_Rank")
+
+prob_data_PL =  as.data.frame(as.table(chosen_PL))
+colnames(prob_data_PL)<- c("Assessor", "Item", "Probability")
+
+prob_data_MM  =  as.data.frame(as.table(chosen_BMM))
+colnames(prob_data_MM)<- c("Assessor", "Item", "Probability")
+
+```
+
+```{r graphing top 2 predictions , PL data}
+
+# Plot for each model
+plot_top_m_unranked_probs(prob_data_MM, "Mallows", 2)
+plot_top_m_unranked_probs(prob_data_PL, "Plackett-Luce",2 )
+
+```
+
+## Calibration of our estimates
+
+- We expect them to not be as good as in our previous simulation since we are working with more uncertainty.
+
+- We see the mallows is so uncertain that it does not have posterior probabilities of > 0.5, however we still observe that our models are well-calibrated
+
+```{r top 1 calibration, PL data}
+plot_calibration_curve(next_2_probs_MM, "Mallows", m = 2, sim_pl)
+plot_calibration_curve(next_2_probs_PL, "Plackett-Luce", m = 2, sim_pl)
+```
+## WAIC
+
+```{r, PL WAIC, PL data}
+# Plackett Luce
+
+# Take sim_pl to an ordering set
+ordering_sim <- as.top_ordering(sim_pl, format_input = 'ranking', aggr = FALSE); NULL
+
+# Preallocate matrix: N rows, S posterior samples
+loglik_matrix_PL <- matrix(NA, nrow = nrow(ordering_sim), ncol = nrow(scores_PL)); NULL
+
+N <- nrow(ordering_sim)
+S <- nrow(scores_PL)
+
+# Loop over samples (columns) and compute per-observation likelihood
+for (s in 1:S) {
+  for (i in 1:N) {
+    loglik_matrix_PL[i, s]  <- loglikPLMIX(
+      pi_inv = matrix(ordering_sim[i, ], nrow = 1),                  # single ranking
+      p = matrix(scores_PL[s, ], nrow = 1),                          # single posterior sample
+      ref_order = matrix(1:ncol(ordering_sim), nrow = 1),           # required, arbitrary for G = 1
+      weights = c(1)                                                 # G = 1
+    ) ; NULL
+  }
+}
+
+lppd <- sum(log(rowMeans(exp(loglik_matrix_PL))))
+penalty_waic <- sum(apply(loglik_matrix_PL, 1, var))
+waic_PL <- -2 * (lppd - penalty_waic)
+
+
+
+
+
+```
+
+```{r MM WAIC, PL data}
+# Mallows
+
+# Preallocate matrix: N rows, S posterior samples
+loglik_matrix_MM <- matrix(NA, nrow = nrow(ordering_sim), ncol = nrow(rho_samples))
+
+# Loop over samples (columns) and compute per-observation likelihood
+
+N <- nrow(sim_pl)
+S <- nrow(rho_samples)
+for (s in 1:S) {
+  for (i in 1:N) {
+    loglik_matrix_MM[i, s] <- get_mallows_loglik(
+                    rho = matrix((rho_samples[s,]), nrow = 1),
+                    alpha = alpha_samples[s],
+                    weights = c(1),
+                    rankings = matrix(rep(sim_pl[i,], times = 2), nrow = 2, byrow = TRUE),
+                    log = TRUE) /2
+  }
+}
+
+
+#WAIC of Mallows model quite a bit lower than the one with PL so it is clear that the Mallows model is a better model for prediction for these two models
+lppd <- sum(log(rowMeans(exp(loglik_matrix_MM))))
+penalty_waic <- sum(apply(loglik_matrix_MM, 1, var))
+waic_MM <- -2 * (lppd - penalty_waic)
+
+```
+
+```{r Plots comparing value, PL data }
+# Data frame
+df <- data.frame(
+  model = c("Plackett–Luce", "Mallows"),
+  WAIC  = c(waic_PL, waic_MM)
+)
+
+# Horizontal bar chart
+ggplot(df, aes(x = WAIC, y = reorder(model, WAIC))) +
+  geom_col(fill = "steelblue") +
+  geom_text(aes(label = round(WAIC, 1)),
+            hjust = -0.1,           # just to the right of the bar
+            size  = 3.5) +
+  scale_x_continuous(expand = expansion(add = c(0, max(df$WAIC)*0.1))) +
+  labs(x = "WAIC",
+       y = NULL,
+       title = "WAIC Comparison: Lower is Better") +
+  theme_minimal()
+```
+
+Try the Bayes Risk method for prediciting the rank of unranked items - Trying Mallows first 
+
+```{r Bayes risk try out }
+m = 2
+library(purrr)
+
+# 1) pull out and filter augmented_data
+df_try <- result_BMM$augmented_data
+df_try <- df_try[df_try$iteration > burnin(result_BMM), ]
+
+
+
+# 2) make sure it’s a data.frame (or tibble) and rename the columns
+df_try <- as.data.frame(df_try)
+colnames(df_try) <- c("chain", "iteration", "Assessor", "Item", "Augmented_Rank")
+
+# 3) now you can safely turn Assessor into a factor
+df_try$Assessor <- factor(df_try$Assessor)
+
+augmented_edited <- df_try %>% 
+  left_join(Partial_Long, by = c('Assessor','Item'))
+
+# inspect
+head(df_try)
+
+
+# List of unique assessors
+assessors <- unique(augmented_edited$Assessor)
+
+# Run optimizer for each assessor and collect results
+all_results <- purrr::map(assessors, function(aid) {
+  
+  # Subset data
+  df_a <- augmented_edited %>% filter(Assessor == aid)
+  
+  # Identify unranked items
+  unranked_items <- df_a %>% filter(Rank == 0) %>% pull(Item) %>% unique()
+  
+  if (length(unranked_items) < 2) {
+    return(list(Assessor = aid, optimal_ranking = NA, bayes_risk = NA, risk_trace = NULL))
+  }
+  
+  # Extract posterior samples of augmented ranks
+  posterior_samples <- df_a %>%
+    filter(Item %in% unranked_items) %>%
+    select(iteration, Item, `Augmented_Rank`) %>%
+    group_by(iteration) %>%
+    summarise(ranking = list(Item[order(`Augmented_Rank`)]), .groups = "drop") %>%
+    pull(ranking)
+  
+  # Run greedy optimizer
+  result <- greedy_bayes_optimizer(posterior_samples)
+  
+  return(list(
+    Assessor = aid,
+    optimal_ranking = result$optimal_ranking,
+    bayes_risk = result$bayes_risk,
+    risk_trace = result$risk_trace
+  ))
+})
+
+summary_df <- purrr::map_dfr(all_results, function(res) {
+  data.frame(
+    Assessor = res$Assessor,
+    Bayes_Risk = res$bayes_risk,
+    Bayes_Ranking = paste(res$optimal_ranking, collapse = " > ")
+  )
+})
+
+                  
+```
+```{r}
+df_a <- augmented_edited %>% filter(Assessor == 1)
+# Identify unranked items
+unranked_items <- df_a %>% filter(Rank == 0) %>% pull(Item) %>% unique()
+
+# Extract posterior samples of augmented ranks
+posterior_samples <- df_a %>%
+    filter(Item %in% unranked_items) %>%
+    select(iteration, Item, `Augmented_Rank`) %>%
+    group_by(iteration) %>%
+    summarise(ranking = list(Item[order(`Augmented_Rank`)]), .groups = "drop") %>%
+    pull(ranking)
+  
+```
+
+
+
+##### Predicting full ordering of unranked items for Plackett-Luce
+
+
+```{r}
+colnames(scores_PL) <- colnames(sim_pl)
+
+for (i in 1:nrow(sim_pl)){
+  
+  posterior_samples_pl[[i]] <- vector('list',nrow(scores_PL))
+}
+
+
+for (i in 1:nrow(scores_PL)){
+  
+  
+  
+  for (j in 1:nrow(sim_pl)){
+    
+    # Simulate an ordering for the unranked items of individual j
+    
+    unranked_items_j <- Partial_Long%>%filter(Assessor == j) %>% filter(Rank == 0) %>% pull(Item)
+    
+    # Grab their corresponding utility scores
+    params <- scores_PL[i, c(unranked_items_j)]
+    
+    # Rank them in order
+    ranking <- SamplingCompleteRankings_PL(params)
+    
+    posterior_samples_pl[[j]][[i]] <- ranking # add ith posterior sample to individual j list
+    
+  }
+}
+
+
+
+
+
+
+
+```
+
+
+# Finding Rankings that minimise the Bayes-Risk for each assessor
+```{r}
+
+test <- greedy_bayes_optimizer(posterior_samples_pl[[6]])
+
+
+```
+```{r}
+# 1) run greedy optimizer for each assessor
+pl_results <- map(1:nrow(sim_pl), function(aid) {
+  samples <- posterior_samples_pl[[aid]]
+  
+  # skip if fewer than 2 items
+  if(length(samples[[1]]) < 2) {
+    return(list(Assessor    = aid,
+                optimal_ranking = NA_character_,
+                bayes_risk      = NA_real_))
+  }
+  
+  res <- greedy_bayes_optimizer(
+    posterior_samples = samples,
+    tol               = 0.1,
+    max_iter          = 100
+  )
+  
+  list(
+    Assessor        = aid,
+    optimal_ranking = res$optimal_ranking,
+    bayes_risk      = res$bayes_risk
+  )
+})
+
+
+```
+### Getting the true relative rankings of the unranked items
+
+```{r}
+#true_rankings <- Partial_Long %>%
+ # filter(Rank)
+
+# Convert to long format
+true_Long <- as.data.frame(sim_pl) %>%
+  mutate(Assessor = factor(row_number())) %>%
+  pivot_longer(cols = starts_with('X'),
+               names_to = 'Item',
+               values_to = 'Rank')
+# Dataframe giving the relative true ranks, we will then compare this with our results from mallows and plackett-Luce
+true_Long_unranked <- true_Long %>%
+  left_join(Partial_Long, by = c('Assessor','Item'))%>%
+  filter(Rank.y == 0) %>%
+  group_by(Assessor) %>%
+  mutate (relative_rank = rank(Rank.x))%>%
+  select(-c(Rank.x,Rank.y))
+
+
+
+
+  
+```
+
+
+```{r}
+# Function to calculate the Kendall error
+kendall_error <- function(true_ranks, predicted_ranks) {
+  # Initialize discordant pairs count
+  discordant_pairs <- 0
+  
+  # Loop through all pairs of items
+  for (i in 1:(length(true_ranks) - 1)) {
+    for (j in (i + 1):length(true_ranks)) {
+      # Check if the pair (i, j) is discordant
+      if ((true_ranks[i] < true_ranks[j] && predicted_ranks[i] > predicted_ranks[j]) ||
+          (true_ranks[i] > true_ranks[j] && predicted_ranks[i] < predicted_ranks[j])) {
+        discordant_pairs <- discordant_pairs + 1
+      }
+    }
+  }
+  
+  # Return the Kendall error (normalized by the number of pairs)
+  N <- length(true_ranks)
+  kendall_error_value <- discordant_pairs / (N * (N - 1) / 2)  # Normalized by the number of possible pairs
+  return(kendall_error_value)
+}
+
+```
+
+```{r}
+# Load necessary libraries
+library(dplyr)
+
+# Assuming you have your true_Long_unranked data frame and pl_results loaded
+# Assuming 'true_Long_unranked' contains columns: Assessor, Item, relative_rank
+# Assuming 'pl_results' contains the optimal ranking for each assessor
+
+# Create an empty data frame to store the MAE results
+mae_results <- data.frame(Assessor = integer(), PL_MAE = numeric(), PL_Kendall_Error = numeric(), MM_MAE = numeric(), MM_Kendall_Error = numeric())
+
+# Loop over each unique assessor
+for (assessor in unique(true_Long_unranked$Assessor)) {
+  
+  # Extract the true rankings for the current assessor
+  true_assessor_ranks <- true_Long_unranked %>%
+    filter(Assessor == assessor) %>%
+    arrange(Item) %>%
+    select(Item, relative_rank)
+  
+  if(length(true_assessor_ranks$Assessor) < 2){
+    next
+  }
+  
+  # Extract the predicted rankings for the current assessor from pl_results
+  predicted_assessor_ranks_pl <- pl_results[[as.integer(assessor)]]$optimal_ranking
+  
+# Extract the predicted rankings for the current assessor from Mallows model
+  predicted_assessor_ranks_MM <- all_results[[as.integer(assessor)]]$optimal_ranking  # Mallows model output
+  
+  # Ensure the predicted rankings are ordered by the same items as the true ranks
+  predicted_assessor_ranks_sorted_pl <- predicted_assessor_ranks_pl[order(true_assessor_ranks$Item)]
+  
+predicted_rank_values_MM <- match(true_assessor_ranks$Item, predicted_assessor_ranks_MM)
+  
+  
+  # Calculate the absolute errors for this assessor
+  pl_errors <- abs(true_assessor_ranks$relative_rank - predicted_assessor_ranks_sorted_pl)
+  
+  # Calculate the absolute errors-Mallows (MAE)
+  mm_errors <- abs(true_assessor_ranks$relative_rank - predicted_rank_values_MM)
+  
+  # Calculate the MAE for this assessor
+  pl_mae <- mean(pl_errors)
+  mm_mae <- mean(mm_errors)
+  # Calculate the Kendall error
+  pl_kendall_err <- kendall_error(true_assessor_ranks$relative_rank, predicted_assessor_ranks_sorted_pl)
+  
+  mm_kendall_err <- kendall_error(true_assessor_ranks$relative_rank, predicted_rank_values_MM)
+  
+  # Store the result in the results data frame
+  mae_results <- rbind(mae_results, data.frame(Assessor = assessor, PL_MAE = pl_mae, PL_Kendall_Error = pl_kendall_err, MM_MAE = mm_mae, MM_Kendall_Error = mm_kendall_err))
+}
+
+# Display the results
+print(mae_results)
+
+
+```
+
+
+
+The mean kendall error for the Plackett-Luce 
+```{r}
+# Load necessary libraries
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+
+# Assuming 'mae_results' is the data frame you already have
+
+# Reshape the data into long format for plotting
+mae_results_long <- mae_results %>%
+  select(Assessor, PL_Kendall_Error, MM_Kendall_Error) %>%
+  gather(key = "Model", value = "Kendall_Error", PL_Kendall_Error, MM_Kendall_Error)
+
+# Plot boxplot to compare PL and MM Kendall errors
+ggplot(mae_results_long, aes(x = Model, y = Kendall_Error, fill = Model)) +
+  geom_boxplot() +
+  labs(title = "Comparison of Kendall Error: PL vs MM", 
+       x = "Model", 
+       y = "Kendall Error") +
+  theme_minimal() +
+  scale_fill_manual(values = c("skyblue", "orange"))
+
+```
+For MAE and Kendall Error Plackett-Luce dominates Mallows Model. However we can see from the graph that the average Kendall Error from the Mallows model is slightly smaller that the PL model. So even though the Plackett-Luce beats it on an overall basis in terms of who beat who. Mallows model has less variance is its' kendall error, this could be attributed to the fact that we are using the Kendall Tau distance for the Mallows model and so the predictions on average try to minimise this distance.
+
+```{r}
+
+# Assuming mae_results is your data frame containing both PL and MM errors
+
+# Function to compute the confidence interval (95% CI) formatted as mean ± CI
+compute_ci <- function(values) {
+  mean_val <- mean(values)
+  stderr <- sd(values) / sqrt(length(values))
+  ci_lower <- mean_val - qnorm(0.975) * stderr
+  ci_upper <- mean_val + qnorm(0.975) * stderr
+  ci <- paste0(round(mean_val, 2), " ± ", round(ci_upper - mean_val, 2))
+  return(ci)
+}
+
+# Compute means and 95% CIs for Plackett-Luce (PL) and Mallows (MM)
+pl_mae_ci <- compute_ci(mae_results$PL_MAE)[[1]]
+pl_kendall_ci <- compute_ci(mae_results$PL_Kendall_Error)
+mm_mae_ci <- compute_ci(mae_results$MM_MAE)
+mm_kendall_ci <- compute_ci(mae_results$MM_Kendall_Error)
+
+# Create a data frame with the results
+comparison_df <- data.frame(
+  Model = c("Plackett-Luce", "Mallows"),
+  MAE_95_CI = c(pl_mae_ci, mm_mae_ci),
+  Kendall_95_CI = c(pl_kendall_ci, mm_kendall_ci)
+)
+
+# Display the comparison table
+comparison_df
+
+
+```
+Expected MAE
